@@ -4,7 +4,20 @@ from typing import Optional, Tuple, Union
 
 import torch
 from einops import rearrange, repeat
-from vortex.ops.embedding.rotary import apply_rotary
+try:
+    from vortex.ops.embedding.rotary import apply_rotary
+
+    _HAS_TRITON_ROTARY = True
+except ImportError:  # pragma: no cover - no triton on this platform
+    apply_rotary = None
+    _HAS_TRITON_ROTARY = False
+
+# NOTE (cross-platform parity): force the reference torch implementation so
+# SDAA and CUDA runs take an identical numeric path.
+import os as _os
+
+if _os.environ.get("VORTEX_ROTARY_FORCE_TORCH", "0") == "1":
+    _HAS_TRITON_ROTARY = False
 
 
 def rotate_half(x, interleaved=False):
@@ -16,11 +29,29 @@ def rotate_half(x, interleaved=False):
         return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
 
 
-def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
+def apply_rotary_emb_torch(x, cos, sin, interleaved=False, seqlen_offsets=0):
     """
     x: (batch_size, seqlen, nheads, headdim)
     cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
     """
+    # NOTE (SDAA adaptation): vortex caches the rotary table and only grows it.
+    # Slice it to [offset : offset + current_len] so both shorter sequences and
+    # KV-cache generation (seqlen_offsets > 0) line up with x.
+    if x.dim() == 4:
+        _seqlen = x.shape[1]
+    elif x.dim() == 3:
+        _seqlen = x.shape[0]
+    else:
+        _seqlen = x.shape[-3]
+
+    off = seqlen_offsets if isinstance(seqlen_offsets, int) else 0
+    if cos.dim() == 2:
+        cos = cos[off : off + _seqlen]
+        sin = sin[off : off + _seqlen]
+    else:
+        cos = cos[:, off : off + _seqlen]
+        sin = sin[:, off : off + _seqlen]
+
     ro_dim = cos.shape[-1] * 2
     assert ro_dim <= x.shape[-1]
     cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
@@ -121,6 +152,10 @@ def apply_rotary_emb(
     rotary_dim must be <= headdim
     Apply rotary embedding to the first rotary_dim of x.
     """
+    if not _HAS_TRITON_ROTARY:
+        # NOTE (SDAA adaptation): Triton kernels are unavailable here; the
+        # reference implementation below is numerically equivalent.
+        return apply_rotary_emb_torch(x, cos, sin, interleaved, seqlen_offsets)
     return ApplyRotaryEmb.apply(x, cos, sin, interleaved, inplace, seqlen_offsets, cu_seqlens, max_seqlen)
 
 
@@ -252,6 +287,42 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
         return dqkv, None, None, None, None, None, None, None
 
 
+def apply_rotary_emb_qkv_torch(
+    qkv,
+    cos,
+    sin,
+    cos_k=None,
+    sin_k=None,
+    interleaved=False,
+    seqlen_offsets=0,
+    num_heads_q=None,
+):
+    """Pure-torch equivalent of ApplyRotaryEmbQKV_ (SDAA / no-triton path)."""
+
+    cos_k = cos if cos_k is None else cos_k
+    sin_k = sin if sin_k is None else sin_k
+
+    if qkv.dim() == 5:
+        q, k = qkv[:, :, 0], qkv[:, :, 1]
+    else:
+        assert qkv.dim() == 4 and num_heads_q is not None
+        num_heads_k = (qkv.shape[2] - num_heads_q) // 2
+        q = qkv[:, :, :num_heads_q]
+        k = qkv[:, :, num_heads_q : num_heads_q + num_heads_k]
+
+    q_out = apply_rotary_emb_torch(q, cos, sin, interleaved, seqlen_offsets)
+    k_out = apply_rotary_emb_torch(k, cos_k, sin_k, interleaved, seqlen_offsets)
+
+    if qkv.dim() == 5:
+        qkv[:, :, 0] = q_out
+        qkv[:, :, 1] = k_out
+    else:
+        nq, nk = q.shape[2], k.shape[2]
+        qkv[:, :, :nq] = q_out
+        qkv[:, :, nq : nq + nk] = k_out
+    return qkv
+
+
 def apply_rotary_emb_qkv_(
     qkv,
     cos,
@@ -278,6 +349,10 @@ def apply_rotary_emb_qkv_(
     rotary_dim must be <= headdim
     Apply rotary embedding *inplace* to the first rotary_dim of Q and K.
     """
+    if not _HAS_TRITON_ROTARY:
+        return apply_rotary_emb_qkv_torch(
+            qkv, cos, sin, cos_k, sin_k, interleaved, seqlen_offsets, num_heads_q
+        )
     return ApplyRotaryEmbQKV_.apply(qkv, cos, sin, cos_k, sin_k, interleaved, seqlen_offsets, num_heads_q)
 
 

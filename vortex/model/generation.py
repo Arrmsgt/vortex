@@ -8,7 +8,7 @@ import numpy as np
 
 from vortex.model.sample import sample
 from vortex.model.tokenizer import CharLevelTokenizer
-from vortex.model.utils import print_rank_0
+from vortex.model.utils import default_device, print_rank_0
 
 
 class Generator:
@@ -152,7 +152,7 @@ class Generator:
             prefilled = False
 
         if verbose:
-            mem_after_tok = torch.cuda.memory_allocated(device=x.device) / 1e9
+            mem_after_tok = _memory_allocated(x.device) / 1e9
             print_rank_0(f"Memory after tokenization: {mem_after_tok} GB")
             print_rank_0("Starting generation...")
             if input_string is not None:
@@ -238,7 +238,7 @@ class Generator:
 
             print(f"\nInput: {input_string}, Output: {y}")
 
-            mem_end = torch.cuda.memory_allocated(device=x.device) / 1e9
+            mem_end = _memory_allocated(x.device) / 1e9
             print(f"Memory after generation: {mem_end} GB")
 
         return generation[:, : i + 1], scores[:, : i + 1], inference_params_dict
@@ -251,7 +251,7 @@ def logits_to_logprobs(logits: torch.Tensor, tokens: torch.Tensor) -> torch.Tens
 
 
 def prepare_batch(
-    seqs: list[str], tokenizer: CharLevelTokenizer, prepend_bos: bool = False, device: str = "cuda:0"
+    seqs: list[str], tokenizer: CharLevelTokenizer, prepend_bos: bool = False, device: str = None
 ) -> tuple[torch.Tensor, list[int]]:
     """Prepare a batch of sequences for the model."""
     if prepend_bos:
@@ -291,7 +291,7 @@ def generate(
     force_prompt_threshold: int = 3000,
     cached_generation: bool = True,
     verbose: int = 1,
-    device: str = "cuda:0",
+    device: str = None,
     **kwargs,
 ) -> GenerationOutput:
     """
@@ -299,6 +299,9 @@ def generate(
     If all prompts are the same length, this can do batched generation.
     Also supports cached generation for efficient sampling.
     """
+    if device is None:
+        device = default_device()
+
     model.eval()
 
     g = Generator(

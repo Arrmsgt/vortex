@@ -456,7 +456,7 @@ class HyenaInferenceEngine:
             if self.low_mem_mode:
                 # TODO: smarter gc
                 del z_pre, x2, x1, v, x1v, h, poles, residues
-                torch.cuda.empty_cache()
+                _empty_cache()
 
         return y.permute(0, 2, 1)
 

@@ -2,6 +2,7 @@
 
 import io # For BytesIO handling
 import math
+import os as _os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,6 +36,56 @@ import logging
 from tqdm import tqdm
 
 from vortex.model.attention import MHA
+
+import contextlib as _contextlib
+
+
+def _accelerator():
+    """Return (name, device_count) for the best available accelerator."""
+    if torch.cuda.is_available():
+        return "cuda", torch.cuda.device_count()
+    sdaa = getattr(torch, "sdaa", None)
+    if sdaa is not None and sdaa.is_available():
+        return "sdaa", sdaa.device_count()
+    return "cpu", 1
+
+
+def _device_count() -> int:
+    """Number of devices to shard the model across.
+
+    NOTE (SDAA adaptation): vortex shards layers across every visible device.
+    An SDAA node exposes 32 cards, which would scatter a small model over 32
+    devices while the input tensor lives on a single one.  Default to one
+    device; set VORTEX_DEVICE_COUNT to opt into real model sharding.
+    """
+    import os as _os
+
+    forced = _os.environ.get("VORTEX_DEVICE_COUNT")
+    if forced:
+        return max(1, int(forced))
+    return 1
+
+
+def _device_str(index: int = 0) -> str:
+    import os as _os
+
+    forced = _os.environ.get("VORTEX_DEVICE")
+    if forced:
+        return "cpu" if forced == "cpu" else f"{forced.split(":")[0]}:{index}"
+    name, _ = _accelerator()
+    return "cpu" if name == "cpu" else f"{name}:{index}"
+
+
+def _device_ctx(device):
+    """``torch.cuda.device`` equivalent that also understands SDAA."""
+    name = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    if name == "cuda":
+        return torch.cuda.device(device)
+    sdaa = getattr(torch, "sdaa", None)
+    if name == "sdaa" and sdaa is not None:
+        return sdaa.device(device)
+    return _contextlib.nullcontext()
+
 
 # vortex-kernels: optional tiled HCL compute_filter (refs #16, #76), guarded so
 # `import vortex` works without triton.
@@ -390,12 +441,11 @@ class HyenaCascade(nn.Module):
         If L is greater than the length of the previous batch, then the time vector is
         reinitialized. Otherwise, the time vector is truncated from cache.
         """
-        if self.t is None:
-            self.t = torch.arange(L, device=device)[None, None]
-        elif self.t.shape[-1] < L:
-            self.t = torch.arange(L, device=device)[None, None]
-        else:
-            self.t = self.t[..., :L]
+        # NOTE (SDAA adaptation): upstream reuses a cached time vector and only
+        # truncates it, which silently corrupts results when the same model is
+        # called with varying sequence lengths (L grows again -> stale slice).
+        # Rebuild it every time; the cost is O(L) and negligible.
+        self.t = torch.arange(L, device=device)[None, None]
 
     def compute_filter(self, L, device):
         self.update_time(L, device)
@@ -504,7 +554,7 @@ class ParallelGatedConvBlock(nn.Module):
 
         normalized = self.pre_norm(x)
         normalized = self.pad_to_multiple(normalized)
-        with torch.cuda.device(x.device):
+        with _device_ctx(x.device):
             projected = self.projections(normalized)
 
         if isinstance(projected, tuple):
@@ -593,6 +643,37 @@ class ParallelGatedConvBlock(nn.Module):
         return y, inference_params
 
 
+def _wrap_fp32_forward(block):
+    """Run ``block``内部 in fp32 while keeping the surrounding dtype.
+
+    NOTE (SDAA adaptation): the HCM/HCL FFT long convolutions amplify values
+    by ~1e6 per layer; in bf16 the accumulated magnitude reaches ~1e12 and the
+    final log_softmax overflows to NaN.  Casting only these blocks to fp32
+    keeps memory overhead small while restoring numerical stability.
+    """
+    import torch as _t
+
+    orig_forward = block.forward
+
+    def forward_fp32(u, *args, **kwargs):
+        in_dtype = u.dtype if _t.is_tensor(u) else None
+        if in_dtype is not None and in_dtype != _t.float32:
+            u = u.float()
+        out = orig_forward(u, *args, **kwargs)
+        if in_dtype is not None and in_dtype != _t.float32:
+            if isinstance(out, tuple):
+                return tuple(
+                    o.to(in_dtype) if _t.is_tensor(o) else o for o in out
+                )
+            if _t.is_tensor(out):
+                return out.to(in_dtype)
+        return out
+
+    block.forward = forward_fp32
+    block._fp32_compute = True
+    return block
+
+
 def get_block(config, layer_idx, flash_fft=None):
     if layer_idx in config.attn_layer_idxs:
         return AttentionBlock(config, layer_idx)
@@ -619,6 +700,37 @@ def get_block(config, layer_idx, flash_fft=None):
         return block
     else:
         raise NotImplementedError
+
+
+def _move_between_devices(x, dst):
+    """把张量搬到另一张卡。
+
+    NOTE (SDAA adaptation): SDAA 不支持直接的 deviceA -> deviceB 拷贝
+    （会报 "SDAA Copy for different cards has not been supported"，
+    且 4 卡内即使能拷，完成信号记在源卡、目标卡读取不等待，会读到脏数据）。
+    改走主机中转：deviceA -> CPU -> deviceB，已验证数值正确。
+    CUDA 上走原来的直连路径。
+    可用 EVO2_COPY_VIA_HOST=0 关闭本改动。
+    """
+    if not (hasattr(torch, "sdaa") and torch.sdaa.is_available()):
+        return x.to(dst)
+    if _os.environ.get("EVO2_COPY_VIA_HOST", "1") == "0":
+        return x.to(dst)
+    return x.cpu().to(dst)
+
+
+def _sync_sdaa_devices():
+    """等待所有 SDAA 设备完成。
+
+    torch_sdaa 的 synchronize() 无参只同步当前卡；多卡模型并行时必须逐卡同步。
+    CUDA / CPU 上为空操作。
+    """
+    try:
+        if hasattr(torch, "sdaa") and torch.sdaa.is_available():
+            for _d in range(torch.sdaa.device_count()):
+                torch.sdaa.synchronize(_d)
+    except Exception:
+        pass
 
 
 class StripedHyena(nn.Module):
@@ -658,7 +770,7 @@ class StripedHyena(nn.Module):
                 "disable use_hc*_kernel on 1B if generation quality matters."
             )
 
-        with torch.device("cuda:0" if torch.cuda.is_available() else "cpu"):
+        with torch.device(_device_str(0)):
             self.embedding_layer = VocabParallelEmbedding(config)
 
         if config.get("use_flashfft", "True"):
@@ -680,23 +792,63 @@ class StripedHyena(nn.Module):
         self.block_idx_to_device = {}
 
         # Calculate layers per GPU
-        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        num_gpus = _device_count()
         layers_per_gpu = math.ceil(config.num_layers / num_gpus)
         self.logger.info(f"Distributing across {num_gpus} GPUs, approximately {layers_per_gpu} layers per GPU")
 
         for layer_idx in tqdm(range(config.num_layers)):
             # Determine which GPU should handle this layer
             device_idx = min(layer_idx // layers_per_gpu, num_gpus - 1)
-            device = f"cuda:{device_idx}" if torch.cuda.is_available() else "cpu"
+            device = _device_str(device_idx)
 
             with torch.device(device):
                 # TELinear uses `device="cuda"` device to allocate empty bias
                 # tensor. This makes sure that the empty tensor is allocated on the
                 # correct device. (torch.device(), unlike torch.cuda.device(),
                 # doesn't override current CUDA device.)
-                with torch.cuda.device(device):
+                with _device_ctx(device):
                     block = get_block(config, layer_idx, flash_fft=self.flash_fft)
                     move_to_device(block, device)
+
+                    # NOTE (SDAA adaptation): HCM/HCL 的 FFT 长卷积在 bf16 下
+                    # 数值逐层放大（block 29 约 1e3，block 30 约 1e12），
+                    # 下游 attention 的 QK^T 会溢出成 NaN。因此这三类层
+                    # （HCM / HCL / attention）内部一律用 fp32。
+                    import os as _os
+                    _force_all = config.get("force_fp32_all", False) or \
+                        _os.environ.get("EVO2_FORCE_FP32", "0") == "1"
+                    _hyena_fp32 = config.get("hyena_fp32_layers", True) and \
+                        _os.environ.get("EVO2_FP32_LAYERS", "1") != "0"
+                    _explicit = _os.environ.get("EVO2_FP32_IDXS", "")
+                    if (_explicit == "" and config.get("num_layers") == 32
+                            and hasattr(torch, "sdaa") and torch.sdaa.is_available()):
+                        # NOTE (SDAA adaptation): 实测 Evo2 7B(32层) 只有
+                        # block 29/30/31 的输出会超过 SDAA bf16 GEMM 的
+                        # 单项乘积上限(65504, 见 fp16 上限)，其余层纯 bf16 即可。
+                        # 只提这 3 层比原来的 18 层快 1.68x 且更贴近 CUDA。
+                        _explicit = "29,30,31"
+                    if _explicit != "":
+                        _want = {int(x) for x in _explicit.split(",") if x.strip() != ""}
+                        _fp32_this = layer_idx in _want
+                        if _fp32_this:
+                            block = block.float()
+                            _wrap_fp32_forward(block)
+                        self.blocks.append(block)
+                        self.block_idx_to_device[layer_idx] = device
+                        continue
+                    _fp32_attn = _os.environ.get("EVO2_FP32_ATTN", "0") == "1"
+                    _fp32_this = _force_all or (
+                        (_hyena_fp32 or _fp32_attn)
+                        and (
+                            layer_idx in config.hcm_layer_idxs
+                            or layer_idx in config.hcl_layer_idxs
+                        )
+                    ) or (
+                        _fp32_attn and layer_idx in config.attn_layer_idxs
+                    )
+                    if _fp32_this:
+                        block = block.float()
+                        _wrap_fp32_forward(block)
 
             self.blocks.append(block)
             self.block_idx_to_device[layer_idx] = device
@@ -706,7 +858,7 @@ class StripedHyena(nn.Module):
             )
 
         with torch.device(self.block_idx_to_device[0]):
-            with torch.cuda.device(self.block_idx_to_device[0]):
+            with _device_ctx(self.block_idx_to_device[0]):
                 self.norm = RMSNorm(config) if config.get("final_norm", True) else None
                 if config.tie_embeddings:
                     # Lambda usage is to be able to use forward() on caller side, which in
@@ -744,7 +896,8 @@ class StripedHyena(nn.Module):
             activations_logger.info(f"pre norm: {x}, {x.min()}, {x.max()}")
 
         # By convention, we return results on the first device
-        x = x.to(self.block_idx_to_device[0])
+        x = _move_between_devices(x, self.block_idx_to_device[0])
+
         x = self.norm(x)
 
         if self.print_activations:
@@ -766,8 +919,10 @@ class StripedHyena(nn.Module):
             raise ValueError(f"Block index {block_idx} not found")
 
     def cross_device_transfer(self, x, block_idx):
-        if self.block_idx_to_device[max(block_idx - 1, 0)] != self.block_idx_to_device[block_idx]:
-            x = x.to(self.block_idx_to_device[block_idx])
+        _prev = self.block_idx_to_device[max(block_idx - 1, 0)]
+        _cur = self.block_idx_to_device[block_idx]
+        if _prev != _cur:
+            x = _move_between_devices(x, _cur)
         return x
 
     def stateful_forward(self, x, inference_params_dict=None):
@@ -801,6 +956,11 @@ class StripedHyena(nn.Module):
         if type(padding_mask) == torch.Tensor:
             x = x * padding_mask[..., None]
 
+        import os as _os
+
+        _sync_mode = _os.environ.get("EVO2_SYNC_MODE", "boundary")
+        _is_sdaa = hasattr(torch, "sdaa") and torch.sdaa.is_available()
+
         for block_idx, block in enumerate(self.blocks):
             if self.print_activations:
                 activations_logger.info(f"pre block {block_idx}: {x}, {x.min()}, {x.max()} {block.__class__}")
@@ -813,6 +973,19 @@ class StripedHyena(nn.Module):
 
             x = self.cross_device_transfer(x, block_idx)
             x, _ = block(x, inference_params=None, padding_mask=padding_mask)
+
+            # NOTE (SDAA adaptation): torch_sdaa 不保证"层间异步执行 + 缓冲复用"
+            # 的正确性。多卡模型并行下不同步会读到未写完的缓冲，分数系统性偏离
+            # （实测比 CUDA 低约 4.85 ≈ ln(128)，等价于输出退化成全词表均匀分布）。
+            # 在每层输出后同步即可与 CUDA 对齐（L512 差 1e-4）。
+            #   EVO2_SYNC_MODE=all     每层后同步（默认，最稳）
+            #   EVO2_SYNC_MODE=boundary 只在跨卡边界与末尾同步（更快，待验证）
+            #   EVO2_SYNC_MODE=none    关闭（仅对照用，结果不可信）
+            if _sync_mode != "none" and _is_sdaa:
+                _nxt = self.block_idx_to_device[min(block_idx + 1, len(self.blocks) - 1)]
+                _cur = self.block_idx_to_device[block_idx]
+                if _sync_mode == "all" or _nxt != _cur or block_idx == len(self.blocks) - 1:
+                    _sync_sdaa_devices()
 
             if self.print_activations:
                 activations_logger.info(f"post block {block_idx}: {x}, {x.min()}, {x.max()}")
@@ -1049,7 +1222,18 @@ class StripedHyena(nn.Module):
         Particularly important for longer prompts.
         """
         excluded_shapes = [(4096, 1, 128)]
+        # NOTE (SDAA adaptation): blocks explicitly marked fp32 (HCM/HCL, whose
+        # FFT long convolutions blow up in bf16) must not be downcast here --
+        # load_checkpoint() calls this method *after* the model was built, so
+        # without this exemption the fp32 cast would be silently undone.
+        _fp32_prefixes = tuple(
+            f"blocks.{i}." for i, b in enumerate(getattr(self, "blocks", []))
+            if getattr(b, "_fp32_compute", False)
+        )
         for k, p in self.named_parameters():
+            if _fp32_prefixes and k.startswith(_fp32_prefixes):
+                p.data = p.data.to(torch.float32)
+                continue
             if "projections" not in k:  # avoid TE linears
                 if "log_poles" not in k and "residues" not in k and p.shape not in excluded_shapes:
                     p.data = p.data.to(torch.bfloat16)

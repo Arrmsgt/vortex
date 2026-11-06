@@ -1,6 +1,48 @@
 import torch
 import logging
 
+
+def _accel():
+    import torch as _t
+    if _t.cuda.is_available():
+        return "cuda"
+    _s = getattr(_t, "sdaa", None)
+    if _s is not None and _s.is_available():
+        return "sdaa"
+    return "cpu"
+
+
+def _device_ctx(device):
+    import contextlib as _c
+    import torch as _t
+    name = device.type if isinstance(device, _t.device) else str(device).split(":")[0]
+    if name == "cuda":
+        return _t.cuda.device(device)
+    _s = getattr(_t, "sdaa", None)
+    if name == "sdaa" and _s is not None:
+        return _s.device(device)
+    return _c.nullcontext()
+
+
+def _empty_cache():
+    import torch as _t
+    if _t.cuda.is_available():
+        _t.cuda.empty_cache()
+    else:
+        _s = getattr(_t, "sdaa", None)
+        if _s is not None and _s.is_available():
+            _s.empty_cache()
+
+
+def _memory_allocated(device=None):
+    import torch as _t
+    if _t.cuda.is_available():
+        return _t.cuda.memory_allocated(device=device)
+    _s = getattr(_t, "sdaa", None)
+    if _s is not None and _s.is_available():
+        return _s.memory_allocated()
+    return 0
+
 log = logging.getLogger(__name__)
 
 
@@ -165,7 +207,7 @@ def fixup_fp8_extra_states(module):
     # trouble when the layer is moved to another GPU. Instead, this is how
     # TE Linear should load extra_state: using parameters' device.
     device = next(module.parameters()).device
-    with torch.cuda.device(device):
+    with _device_ctx(device):
         module.set_extra_state(module.get_extra_state())
 
     # Make sure we actually fixed everything we wanted.
@@ -191,7 +233,7 @@ def fixup_te_workspace():
         log.info(f"Fixup applied: Allocating cublas workspace for {device=}")
         import transformer_engine.pytorch.module.base as tebase
 
-        with torch.cuda.device(device):
+        with _device_ctx(device):
             tebase._cublas_workspace = None  # Force get_workspace() to reallocate tensor
             return tebase.get_workspace()
 
@@ -236,6 +278,22 @@ def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
 
+
+
+def default_device() -> str:
+    """Best available accelerator as a device string.
+
+    NOTE (SDAA adaptation): upstream hardcoded "cuda:0" in several defaults,
+    which raises "Torch not compiled with CUDA enabled" on non-CUDA builds.
+    """
+    import torch as _t
+
+    if _t.cuda.is_available():
+        return "cuda:0"
+    _s = getattr(_t, "sdaa", None)
+    if _s is not None and _s.is_available():
+        return "sdaa:0"
+    return "cpu"
 
 def divide(numerator, denominator):
     """Ensure that numerator is divisible by the denominator and return
